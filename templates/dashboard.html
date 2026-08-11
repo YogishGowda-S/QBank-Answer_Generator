@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head><title>Dashboard</title></head>
+<body>
+    <h2>My Subjects</h2>
+    <a href="/logout">Logout</a>
+    <br><br>
+
+    {% if subjects %}
+        <ul>
+        {% for subject in subjects %}
+            <li>
+                <a href="/subject/{{ subject[0] }}">{{ subject[1] }}</a>
+                — created {{ subject[2] }}
+            </li>
+        {% endfor %}
+        </ul>
+    {% else %}
+        <p>No subjects yet.</p>
+    {% endif %}
+
+    <br>
+    <a href="/add_subject">+ Add Subject</a>
+</body>
+</html>
