@@ -9,6 +9,8 @@ from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 
+app.config['MAX_CONTNENT_LENGTH']=16*1024*1024
+
 app = Flask(__name__)
 app.secret_key = "qbank_secret_key"
 
