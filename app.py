@@ -12,7 +12,7 @@ from reportlab.lib.styles import getSampleStyleSheet
 app = Flask(__name__)
 app.secret_key = "qbank_secret_key"
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY", "xxxx"))
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # SQLite Database
 DATABASE = 'qbank_app.db'
