@@ -2,6 +2,6 @@ Flask==2.3.2
 python-docx==0.8.11
 pdfplumber==0.9.0
 groq==0.10.0
-hhttpx==0.24.1
+httpx==0.24.1
 reportlab==4.0.4
 gunicorn==21.2.0
