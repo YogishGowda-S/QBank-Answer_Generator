@@ -1,27 +1,80 @@
 from flask import Flask, render_template, request, redirect, session, send_file
-import mysql.connector
+import sqlite3
 import os
 import re
 import docx
 import pdfplumber
 from groq import Groq
 from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 
 app = Flask(__name__)
 app.secret_key = "qbank_secret_key"
 
-groq_client = Groq(api_key="Your groq API Key")
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY", "xxxx"))
+
+# SQLite Database
+DATABASE = 'qbank_app.db'
 
 def get_db():
-    return mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="Your My SQL Password",
-        database="qbank_app"
-    )
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS subjects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject_id INTEGER NOT NULL,
+            question_text TEXT NOT NULL,
+            marks INTEGER,
+            unit TEXT,
+            FOREIGN KEY (subject_id) REFERENCES subjects(id)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS note_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject_id INTEGER NOT NULL,
+            source_file TEXT,
+            chunk_text TEXT NOT NULL,
+            FOREIGN KEY (subject_id) REFERENCES subjects(id)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS answers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            question_id INTEGER NOT NULL,
+            answer_text TEXT,
+            word_count INTEGER,
+            FOREIGN KEY (question_id) REFERENCES questions(id)
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+# Initialize database on startup
+init_db()
 
 def parse_questions(docx_paths):
     questions = []
@@ -49,7 +102,6 @@ def parse_questions(docx_paths):
             if len(text.split()) < 5:
                 continue
             seen.add(text)
-            # Better marks detection
             match = re.search(r'\b(\d+)\s*[Mm]arks?\b|\[(\d+)\]|\((\d+)\)|\b(\d+)[Mm]\b', text)
             marks = 0
             if match:
@@ -91,19 +143,15 @@ def parse_notes(pdf_paths):
     return all_text
 
 def clean_answer(raw):
-    # Remove ALL thinking patterns aggressively
     raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL)
     raw = re.sub(r'<thinking>.*?</thinking>', '', raw, flags=re.DOTALL)
 
-    # Find where real answer starts and cut everything before it
-    # Real answer usually starts with Introduction, Definition, or a heading
     real_start_patterns = [
         r'(?=\*\*Introduction\*\*)',
         r'(?=\*\*Definition\*\*)',
         r'(?=\*\*Normalization\*\*)',
         r'(?=Introduction\n)',
         r'(?=Definition\n)',
-        r'(?=\d+\. Introduction)',
     ]
     for pattern in real_start_patterns:
         match = re.search(pattern, raw, re.IGNORECASE)
@@ -111,7 +159,6 @@ def clean_answer(raw):
             raw = raw[match.start():]
             break
 
-    # Remove line by line if thinking patterns still present
     lines = raw.split('\n')
     clean_lines = []
     skip_line_patterns = [
@@ -119,7 +166,7 @@ def clean_answer(raw):
         'analyze user input', '- role:', '- task:',
         '- marks:', '- length:', '- structure:', '- source:',
         'constraint check', 'deconstruct requirements',
-        'mental to text', 'line count check', 'write content',
+        'mental to text', 'line count', 'write content',
         'identify key requirements', 'draft the answer',
         'never skip', 'output only', 'start every',
         'required length', 'specific format',
@@ -131,18 +178,15 @@ def clean_answer(raw):
         line_lower = line.lower().strip()
         if any(p in line_lower for p in skip_line_patterns):
             continue
-        # Skip numbered analysis steps like "1. Analyze..." "2. Identify..."
         if re.match(r'^\d+\.\s+\*\*(Analyze|Identify|Deconstruct|Draft|Write|Line|Constraint|Mental)', line):
             continue
         clean_lines.append(line)
 
     raw = '\n'.join(clean_lines)
 
-    # Convert markdown to HTML
     raw = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', raw)
     raw = re.sub(r'\*(.*?)\*', r'<em>\1</em>', raw)
 
-    # Convert markdown tables to HTML tables
     lines = raw.split('\n')
     result_lines = []
     in_table = False
@@ -153,15 +197,12 @@ def clean_answer(raw):
             if not in_table:
                 in_table = True
                 table_rows = []
-            # Parse table row
             cells = [c.strip() for c in line.strip().strip('|').split('|')]
             table_rows.append(cells)
         else:
             if in_table:
-                # Convert collected table rows to HTML
                 html_table = "<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse; width:100%; margin:10px 0;'>"
                 for idx, row in enumerate(table_rows):
-                    # Skip separator rows like |---|---|
                     if all(re.match(r'^[-:]+$', cell) for cell in row if cell):
                         continue
                     html_table += "<tr>"
@@ -212,17 +253,15 @@ Question: {question['text']}
 Marks: {marks}
 {length_guide}
 
-Important formatting rules:
-- Write ONLY the answer. No thinking process. No analysis. No commentary.
-- Start directly with the answer content.
+Rules:
+- Write ONLY the answer. Start directly with content.
 - Use markdown bold (**text**) for headings.
-- If comparing two concepts, use a markdown table like this:
-  | Feature | Concept A | Concept B |
-  |---------|-----------|-----------|
-  | Point 1 | Detail    | Detail    |
-- Do NOT write "Here's a thinking process" or any analysis steps.
-- Do NOT include HTML tags like (HTML Table) in your response.
-- Just write the clean exam answer directly."""
+- If comparing two concepts, use a markdown table like:
+  | Feature | A | B |
+  |---------|---|---|
+  | Point   | x | y |
+- Do NOT write any thinking process or analysis steps.
+- Just write the clean exam answer."""
 
     try:
         response = groq_client.chat.completions.create(
@@ -230,7 +269,7 @@ Important formatting rules:
             messages=[
                 {
                     "role": "system",
-                    "content": "You are an exam answer writer for engineering students. Write only the answer directly. No thinking process. No analysis steps. No preamble. Start immediately with the answer content."
+                    "content": "You are an exam answer writer for engineering students. Write only the answer directly. No thinking process. No analysis. No preamble. Start immediately with the answer."
                 },
                 {
                     "role": "user",
@@ -276,7 +315,6 @@ def generate_pdf(questions, answers, output_path, subject_name):
 
         story.append(Spacer(1, 6))
 
-        # Strip HTML for PDF
         clean = re.sub(r'<table.*?</table>', '', answer, flags=re.DOTALL)
         clean = re.sub(r'<.*?>', ' ', clean)
         clean = clean.replace('&nbsp;', ' ')
@@ -295,10 +333,6 @@ def generate_pdf(questions, answers, output_path, subject_name):
 
     doc.build(story)
 
-# ─────────────────────────────────────────
-# ROUTES
-# ─────────────────────────────────────────
-
 @app.route("/")
 def home():
     if "user_id" not in session:
@@ -314,7 +348,7 @@ def signup():
         cursor = db.cursor()
         try:
             cursor.execute(
-                "INSERT INTO users (email, password_hash) VALUES (%s, %s)",
+                "INSERT INTO users (email, password_hash) VALUES (?, ?)",
                 (email, password)
             )
             db.commit()
@@ -333,7 +367,7 @@ def login():
         db = get_db()
         cursor = db.cursor()
         cursor.execute(
-            "SELECT id FROM users WHERE email=%s AND password_hash=%s",
+            "SELECT id FROM users WHERE email=? AND password_hash=?",
             (email, password)
         )
         user = cursor.fetchone()
@@ -357,7 +391,7 @@ def dashboard():
     db = get_db()
     cursor = db.cursor()
     cursor.execute(
-        "SELECT id, name, created_at FROM subjects WHERE user_id=%s",
+        "SELECT id, name, created_at FROM subjects WHERE user_id=?",
         (session["user_id"],)
     )
     subjects = cursor.fetchall()
@@ -373,7 +407,7 @@ def add_subject():
         db = get_db()
         cursor = db.cursor()
         cursor.execute(
-            "INSERT INTO subjects (user_id, name) VALUES (%s, %s)",
+            "INSERT INTO subjects (user_id, name) VALUES (?, ?)",
             (session["user_id"], name)
         )
         db.commit()
@@ -388,7 +422,7 @@ def subject_detail(subject_id):
     db = get_db()
     cursor = db.cursor()
     cursor.execute(
-        "SELECT id, name FROM subjects WHERE id=%s AND user_id=%s",
+        "SELECT id, name FROM subjects WHERE id=? AND user_id=?",
         (subject_id, session["user_id"])
     )
     subject = cursor.fetchone()
@@ -396,7 +430,7 @@ def subject_detail(subject_id):
         """SELECT q.question_text, q.marks, a.answer_text
            FROM questions q
            LEFT JOIN answers a ON q.id = a.question_id
-           WHERE q.subject_id=%s""",
+           WHERE q.subject_id=?""",
         (subject_id,)
     )
     qa_pairs = cursor.fetchall()
@@ -439,15 +473,15 @@ def upload(subject_id):
         db = get_db()
         cursor = db.cursor()
         cursor.execute(
-            "DELETE FROM answers WHERE question_id IN (SELECT id FROM questions WHERE subject_id=%s)",
+            "DELETE FROM answers WHERE question_id IN (SELECT id FROM questions WHERE subject_id=?)",
             (subject_id,)
         )
-        cursor.execute("DELETE FROM questions WHERE subject_id=%s", (subject_id,))
-        cursor.execute("DELETE FROM note_chunks WHERE subject_id=%s", (subject_id,))
+        cursor.execute("DELETE FROM questions WHERE subject_id=?", (subject_id,))
+        cursor.execute("DELETE FROM note_chunks WHERE subject_id=?", (subject_id,))
         db.commit()
 
         cursor.execute(
-            "INSERT INTO note_chunks (subject_id, source_file, chunk_text) VALUES (%s, %s, %s)",
+            "INSERT INTO note_chunks (subject_id, source_file, chunk_text) VALUES (?, ?, ?)",
             (subject_id, "combined_notes", notes_text[:100000])
         )
 
@@ -455,12 +489,12 @@ def upload(subject_id):
 
         for question, answer in zip(questions, answers):
             cursor.execute(
-                "INSERT INTO questions (subject_id, question_text, marks) VALUES (%s, %s, %s)",
+                "INSERT INTO questions (subject_id, question_text, marks) VALUES (?, ?, ?)",
                 (subject_id, question["text"], question["marks"])
             )
             question_id = cursor.lastrowid
             cursor.execute(
-                "INSERT INTO answers (question_id, answer_text, word_count) VALUES (%s, %s, %s)",
+                "INSERT INTO answers (question_id, answer_text, word_count) VALUES (?, ?, ?)",
                 (question_id, answer, len(answer.split()))
             )
         db.commit()
@@ -481,11 +515,11 @@ def download(subject_id):
         """SELECT q.question_text, q.marks, a.answer_text
            FROM questions q
            LEFT JOIN answers a ON q.id = a.question_id
-           WHERE q.subject_id=%s""",
+           WHERE q.subject_id=?""",
         (subject_id,)
     )
     rows = cursor.fetchall()
-    cursor.execute("SELECT name FROM subjects WHERE id=%s", (subject_id,))
+    cursor.execute("SELECT name FROM subjects WHERE id=?", (subject_id,))
     subject = cursor.fetchone()
     db.close()
 
