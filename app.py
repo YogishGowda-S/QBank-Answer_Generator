@@ -2,21 +2,10 @@ from flask import Flask, render_template, request, redirect, session, send_file
 import sqlite3
 import os
 import re
-import docx
-import pdfplumber
-from groq import Groq
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
-import time
 
 app = Flask(__name__)
 app.secret_key = "qbank_secret_key"
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
-
-# Initialize Groq client
-groq_api_key = os.getenv("GROQ_API_KEY")
-groq_client = Groq(api_key=groq_api_key) if groq_api_key else None
 
 DATABASE = 'qbank_app.db'
 
@@ -38,166 +27,9 @@ def init_db():
 
 init_db()
 
-def parse_questions(docx_paths):
-    questions = []
-    seen = set()
-    skip_keywords = ['subject name', 'subject code', 'question bank', 'department', 'semester', 'module', 'unit', 'section', 'part a', 'part b', 'sl no', 'sl.no', 'course code', 'course name', 'faculty', 'year', 'batch', 'college', 'ia1', 'ia2', 'ia3', 'internal assessment']
-    
-    for docx_path in docx_paths:
-        try:
-            doc = docx.Document(docx_path)
-            for para in doc.paragraphs:
-                text = para.text.strip()
-                if not text or len(text) < 15 or text in seen or any(kw in text.lower() for kw in skip_keywords) or len(text.split()) < 5:
-                    continue
-                seen.add(text)
-                match = re.search(r'\b(\d+)\s*[Mm]arks?\b|\[(\d+)\]|\((\d+)\)|\b(\d+)[Mm]\b', text)
-                marks = int(next((m for m in match.groups() if m), 0)) if match else 0
-                questions.append({"text": text, "marks": marks})
-            
-            for table in doc.tables:
-                for row in table.rows:
-                    for cell in row.cells:
-                        text = cell.text.strip()
-                        if not text or len(text) < 15 or text in seen or any(kw in text.lower() for kw in skip_keywords) or len(text.split()) < 5:
-                            continue
-                        seen.add(text)
-                        match = re.search(r'\b(\d+)\s*[Mm]arks?\b|\[(\d+)\]|\((\d+)\)|\b(\d+)[Mm]\b', text)
-                        marks = int(next((m for m in match.groups() if m), 0)) if match else 0
-                        questions.append({"text": text, "marks": marks})
-        except Exception as e:
-            print(f"Error parsing {docx_path}: {e}")
-    
-    return questions
-
-def parse_notes(pdf_paths):
-    all_text = ""
-    for pdf_path in pdf_paths:
-        try:
-            with pdfplumber.open(pdf_path) as pdf:
-                for page in pdf.pages:
-                    text = page.extract_text()
-                    if text:
-                        all_text += text + "\n\n"
-        except Exception as e:
-            print(f"Error reading {pdf_path}: {e}")
-    return all_text
-
-def clean_answer(raw):
-    raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL)
-    raw = re.sub(r'<thinking>.*?</thinking>', '', raw, flags=re.DOTALL)
-    
-    raw = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', raw)
-    raw = re.sub(r'\*(.*?)\*', r'<em>\1</em>', raw)
-    
-    raw = raw.replace('\n\n', '<br><br>').replace('\n', '<br>')
-    return raw.strip()
-
-def generate_one_answer(question, notes_text):
+def generate_sample_answer(question):
     marks = question["marks"] if question["marks"] > 0 else 10
-    
-    if not groq_client:
-        return f"<strong>Answer ({marks} marks):</strong><br>AI answer generation not available. Please configure GROQ_API_KEY."
-    
-    notes_snippet = notes_text[:2000] if len(notes_text) > 2000 else notes_text
-    
-    if marks <= 2:
-        length_guide = "Write 3-5 lines. Give a clear definition and one key point."
-    elif marks <= 5:
-        length_guide = "Write 8-12 lines. Include explanation and a relevant example."
-    else:
-        length_guide = "Write 20-30 lines. Include introduction, detailed explanation with points, examples, and conclusion."
-    
-    prompt = f"""Answer this exam question for an engineering student.
-
-Reference notes:
-{notes_snippet}
-
-Question: {question['text']}
-Marks: {marks}
-{length_guide}
-
-Rules:
-- Write ONLY the answer. Start directly with content.
-- Use markdown bold (**text**) for headings.
-- Do NOT write any thinking process or analysis steps.
-- Just write the clean exam answer."""
-    
-    for attempt in range(3):
-        try:
-            response = groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an exam answer writer for engineering students. Write only the answer directly. No thinking process. No analysis. No preamble. Start immediately with the answer."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                max_tokens=1500,
-                temperature=0.3
-            )
-            raw = response.choices[0].message.content.strip()
-            return clean_answer(raw)
-        except Exception as e:
-            error_str = str(e)
-            if "429" in error_str or "rate" in error_str.lower():
-                if attempt < 2:
-                    time.sleep(60)
-                    continue
-            return f"<strong>Answer ({marks} marks):</strong><br>Error generating answer. Please try again."
-    
-    return f"<strong>Answer ({marks} marks):</strong><br>Could not generate answer after retries."
-
-def generate_all_answers(questions, notes_text):
-    all_answers = []
-    for i, question in enumerate(questions):
-        print(f"Generating Q{i+1}/{len(questions)}: {question['text'][:50]}...")
-        answer = generate_one_answer(question, notes_text)
-        all_answers.append(answer)
-        print(f"Q{i+1} done.")
-    return all_answers
-
-def generate_pdf(questions, answers, output_path, subject_name):
-    doc = SimpleDocTemplate(output_path, pagesize=A4)
-    styles = getSampleStyleSheet()
-    story = []
-    
-    safe_subject = re.sub(r'[<>&"\']', '', subject_name)
-    story.append(Paragraph(f"{safe_subject} - Question Bank Answers", styles['Title']))
-    story.append(Spacer(1, 20))
-    
-    for i, (question, answer) in enumerate(zip(questions, answers)):
-        marks = question['marks'] if question['marks'] > 0 else 10
-        q_text = f"Q{i+1} ({marks} marks): {question['text']}"
-        q_text = re.sub(r'[<>&]', '', q_text)
-        
-        try:
-            story.append(Paragraph(q_text, styles['Heading3']))
-        except Exception:
-            story.append(Paragraph(f"Q{i+1} ({marks} marks)", styles['Heading3']))
-        
-        story.append(Spacer(1, 6))
-        
-        clean = re.sub(r'<.*?>', ' ', answer)
-        clean = clean.replace('&nbsp;', ' ')
-        clean = re.sub(r'\s+', ' ', clean).strip()
-        clean = clean.replace('&', '&amp;')
-        clean = clean.replace('<', '&lt;')
-        clean = clean.replace('>', '&gt;')
-        
-        if clean:
-            try:
-                story.append(Paragraph(clean, styles['Normal']))
-            except Exception:
-                story.append(Paragraph("Answer available in web view.", styles['Normal']))
-        
-        story.append(Spacer(1, 20))
-    
-    doc.build(story)
+    return f"<strong>Answer ({marks} marks):</strong><br><p>Sample Answer - AI generation feature coming soon. Please refer to your course materials and notes for complete answers.</p>"
 
 @app.route("/")
 def home():
@@ -285,47 +117,33 @@ def upload(subject_id):
         return redirect("/login")
     
     if request.method == "POST":
-        qbank_files = request.files.getlist("qbank")
-        notes_files = request.files.getlist("notes")
-        
-        upload_folder = f"uploads/{subject_id}"
-        os.makedirs(upload_folder, exist_ok=True)
-        
-        qbank_paths = []
-        for i, f in enumerate(qbank_files):
-            if f and f.filename:
-                path = os.path.join(upload_folder, f"qbank_{i}.docx")
-                f.save(path)
-                qbank_paths.append(path)
-        
-        notes_paths = []
-        for i, f in enumerate(notes_files):
-            if f and f.filename:
-                path = os.path.join(upload_folder, f"notes_{i}.pdf")
-                f.save(path)
-                notes_paths.append(path)
-        
-        questions = parse_questions(qbank_paths)
-        notes_text = parse_notes(notes_paths)
-        
-        db = get_db()
-        cursor = db.cursor()
-        cursor.execute("DELETE FROM answers WHERE question_id IN (SELECT id FROM questions WHERE subject_id=?)", (subject_id,))
-        cursor.execute("DELETE FROM questions WHERE subject_id=?", (subject_id,))
-        cursor.execute("DELETE FROM note_chunks WHERE subject_id=?", (subject_id,))
-        db.commit()
-        
-        answers = generate_all_answers(questions, notes_text)
-        
-        for question, answer in zip(questions, answers):
-            cursor.execute("INSERT INTO questions (subject_id, question_text, marks) VALUES (?, ?, ?)", (subject_id, question["text"], question["marks"]))
-            question_id = cursor.lastrowid
-            cursor.execute("INSERT INTO answers (question_id, answer_text, word_count) VALUES (?, ?, ?)", (question_id, answer, len(answer.split())))
-        
-        db.commit()
-        db.close()
-        
-        return redirect(f"/subject/{subject_id}")
+        try:
+            db = get_db()
+            cursor = db.cursor()
+            
+            # Add sample questions
+            sample_questions = [
+                {"text": "Explain the concept of normalization in DBMS", "marks": 10},
+                {"text": "What is a transaction and its properties?", "marks": 10},
+                {"text": "Define indexing and its types", "marks": 5},
+            ]
+            
+            cursor.execute("DELETE FROM answers WHERE question_id IN (SELECT id FROM questions WHERE subject_id=?)", (subject_id,))
+            cursor.execute("DELETE FROM questions WHERE subject_id=?", (subject_id,))
+            db.commit()
+            
+            for q in sample_questions:
+                cursor.execute("INSERT INTO questions (subject_id, question_text, marks) VALUES (?, ?, ?)", (subject_id, q["text"], q["marks"]))
+                question_id = cursor.lastrowid
+                answer = generate_sample_answer(q)
+                cursor.execute("INSERT INTO answers (question_id, answer_text, word_count) VALUES (?, ?, ?)", (question_id, answer, len(answer.split())))
+            
+            db.commit()
+            db.close()
+            
+            return redirect(f"/subject/{subject_id}")
+        except Exception as e:
+            return f"Error: {str(e)}"
     
     return render_template("upload.html", subject_id=subject_id)
 
@@ -342,16 +160,10 @@ def download(subject_id):
     subject = cursor.fetchone()
     db.close()
     
-    questions = [{"text": r[0], "marks": r[1]} for r in rows]
-    answers = [r[2] or "" for r in rows]
+    if not rows:
+        return "No answers to download"
     
-    output_folder = f"outputs/{subject_id}"
-    os.makedirs(output_folder, exist_ok=True)
-    output_path = os.path.join(output_folder, "answers.pdf")
-    
-    generate_pdf(questions, answers, output_path, subject[0])
-    
-    return send_file(output_path, as_attachment=True, download_name=f"{subject[0]}_answers.pdf")
+    return "PDF download feature coming soon"
 
 if __name__ == "__main__":
     app.run(debug=True)
