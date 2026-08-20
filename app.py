@@ -1,35 +1,301 @@
 from flask import Flask, render_template, request, redirect, session, send_file
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import os
 import re
+import docx
+import pdfplumber
+from groq import Groq
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+import time
 
 app = Flask(__name__)
 app.secret_key = "qbank_secret_key"
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
-DATABASE = 'qbank_app.db'
-
+# Database connection from environment
 def get_db():
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        db_url = os.getenv("DATABASE_URL")
+        if db_url:
+            # Render PostgreSQL
+            conn = psycopg2.connect(db_url)
+        else:
+            # Local PostgreSQL
+            conn = psycopg2.connect(
+                host="localhost",
+                user=os.getenv("DB_USER", "postgres"),
+                password=os.getenv("DB_PASSWORD", "password"),
+                database=os.getenv("DB_NAME", "qbank_app")
+            )
+        conn.autocommit = False
+        return conn
+    except Exception as e:
+        print(f"Database connection error: {e}")
+        raise
+
+# Initialize Groq
+groq_api_key = os.getenv("GROQ_API_KEY")
+groq_client = Groq(api_key=groq_api_key) if groq_api_key else None
 
 def init_db():
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-    cursor.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)')
-    cursor.execute('CREATE TABLE IF NOT EXISTS subjects (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, name TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (user_id) REFERENCES users(id))')
-    cursor.execute('CREATE TABLE IF NOT EXISTS questions (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_id INTEGER NOT NULL, question_text TEXT NOT NULL, marks INTEGER, unit TEXT, FOREIGN KEY (subject_id) REFERENCES subjects(id))')
-    cursor.execute('CREATE TABLE IF NOT EXISTS note_chunks (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_id INTEGER NOT NULL, source_file TEXT, chunk_text TEXT NOT NULL, FOREIGN KEY (subject_id) REFERENCES subjects(id))')
-    cursor.execute('CREATE TABLE IF NOT EXISTS answers (id INTEGER PRIMARY KEY AUTOINCREMENT, question_id INTEGER NOT NULL, answer_text TEXT, word_count INTEGER, FOREIGN KEY (question_id) REFERENCES questions(id))')
-    conn.commit()
-    conn.close()
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                password_hash VARCHAR(255) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS subjects (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS questions (
+                id SERIAL PRIMARY KEY,
+                subject_id INTEGER NOT NULL,
+                question_text TEXT NOT NULL,
+                marks INTEGER,
+                unit VARCHAR(100),
+                FOREIGN KEY (subject_id) REFERENCES subjects(id)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS note_chunks (
+                id SERIAL PRIMARY KEY,
+                subject_id INTEGER NOT NULL,
+                source_file VARCHAR(255),
+                chunk_text TEXT NOT NULL,
+                FOREIGN KEY (subject_id) REFERENCES subjects(id)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS answers (
+                id SERIAL PRIMARY KEY,
+                question_id INTEGER NOT NULL,
+                answer_text TEXT,
+                word_count INTEGER,
+                FOREIGN KEY (question_id) REFERENCES questions(id)
+            )
+        ''')
+        conn.commit()
+        cursor.close()
+        conn.close()
+        print("Database initialized successfully")
+    except Exception as e:
+        print(f"Database initialization error: {e}")
 
 init_db()
 
-def generate_sample_answer(question):
+def parse_questions(docx_paths):
+    questions = []
+    seen = set()
+    skip_keywords = [
+        'subject name', 'subject code', 'question bank',
+        'department', 'semester', 'module', 'unit', 'section',
+        'part a', 'part b', 'sl no', 'sl.no', 'course code',
+        'course name', 'faculty', 'year', 'batch', 'college',
+        'ia1', 'ia2', 'ia3', 'internal assessment'
+    ]
+
+    for docx_path in docx_paths:
+        try:
+            doc = docx.Document(docx_path)
+            for para in doc.paragraphs:
+                text = para.text.strip()
+                if not text or len(text) < 15 or text in seen or any(kw in text.lower() for kw in skip_keywords) or len(text.split()) < 5:
+                    continue
+                seen.add(text)
+                match = re.search(r'\b(\d+)\s*[Mm]arks?\b|\[(\d+)\]|\((\d+)\)|\b(\d+)[Mm]\b', text)
+                marks = int(next((m for m in match.groups() if m), 0)) if match else 0
+                questions.append({"text": text, "marks": marks})
+
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        text = cell.text.strip()
+                        if not text or len(text) < 15 or text in seen or any(kw in text.lower() for kw in skip_keywords) or len(text.split()) < 5:
+                            continue
+                        seen.add(text)
+                        match = re.search(r'\b(\d+)\s*[Mm]arks?\b|\[(\d+)\]|\((\d+)\)|\b(\d+)[Mm]\b', text)
+                        marks = int(next((m for m in match.groups() if m), 0)) if match else 0
+                        questions.append({"text": text, "marks": marks})
+        except Exception as e:
+            print(f"Error parsing {docx_path}: {e}")
+
+    return questions
+
+def parse_notes(pdf_paths):
+    all_text = ""
+    for pdf_path in pdf_paths:
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if text:
+                        all_text += text + "\n\n"
+        except Exception as e:
+            print(f"Error reading {pdf_path}: {e}")
+    return all_text
+
+def clean_answer(raw):
+    raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL)
+    raw = re.sub(r'<thinking>.*?</thinking>', '', raw, flags=re.DOTALL)
+
+    raw = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', raw)
+    raw = re.sub(r'\*(.*?)\*', r'<em>\1</em>', raw)
+
+    lines = raw.split('\n')
+    result_lines = []
+    in_table = False
+    table_rows = []
+
+    for line in lines:
+        if '|' in line and line.strip().startswith('|'):
+            if not in_table:
+                in_table = True
+                table_rows = []
+            cells = [c.strip() for c in line.strip().strip('|').split('|')]
+            table_rows.append(cells)
+        else:
+            if in_table:
+                html_table = "<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse; width:100%; margin:10px 0;'>"
+                for idx, row in enumerate(table_rows):
+                    if all(re.match(r'^[-:]+$', cell) for cell in row if cell):
+                        continue
+                    html_table += "<tr>"
+                    tag = "th" if idx == 0 else "td"
+                    for cell in row:
+                        html_table += f"<{tag} style='padding:6px; border:1px solid #ccc;'>{cell}</{tag}>"
+                    html_table += "</tr>"
+                html_table += "</table>"
+                result_lines.append(html_table)
+                in_table = False
+                table_rows = []
+            result_lines.append(line)
+
+    if in_table and table_rows:
+        html_table = "<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse; width:100%; margin:10px 0;'>"
+        for idx, row in enumerate(table_rows):
+            if all(re.match(r'^[-:]+$', cell) for cell in row if cell):
+                continue
+            html_table += "<tr>"
+            tag = "th" if idx == 0 else "td"
+            for cell in row:
+                html_table += f"<{tag} style='padding:6px; border:1px solid #ccc;'>{cell}</{tag}>"
+            html_table += "</tr>"
+        html_table += "</table>"
+        result_lines.append(html_table)
+
+    raw = '\n'.join(result_lines)
+    raw = raw.replace('\n\n', '<br><br>').replace('\n', '<br>')
+    return raw.strip()
+
+def generate_one_answer(question, notes_text):
+    if not groq_client:
+        marks = question["marks"] if question["marks"] > 0 else 10
+        return f"<strong>Answer ({marks} marks):</strong><br>API not configured"
+
+    notes_snippet = notes_text[:2000] if len(notes_text) > 2000 else notes_text
     marks = question["marks"] if question["marks"] > 0 else 10
-    return f"<strong>Answer ({marks} marks):</strong><br><p>Sample Answer - AI generation feature coming soon. Please refer to your course materials and notes for complete answers.</p>"
+
+    if marks <= 2:
+        length_guide = "Write 3-5 lines. Give a clear definition and one key point."
+    elif marks <= 5:
+        length_guide = "Write 8-12 lines. Include explanation and a relevant example."
+    else:
+        length_guide = "Write 20-30 lines. Include introduction, detailed explanation with points, examples, and conclusion."
+
+    prompt = f"""Answer this exam question for an engineering student.
+
+Reference notes:
+{notes_snippet}
+
+Question: {question['text']}
+Marks: {marks}
+{length_guide}
+
+Important formatting rules:
+- Write ONLY the answer. No thinking process. No analysis. No commentary.
+- Start directly with the answer content.
+- Use markdown bold (**text**) for headings.
+- If comparing two concepts, use a markdown table.
+- Do NOT write "Here's a thinking process" or any analysis steps.
+- Just write the clean exam answer directly."""
+
+    for attempt in range(3):
+        try:
+            response = groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an exam answer writer for engineering students. Write only the answer directly. No thinking process. Start immediately with the answer content."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                max_tokens=1500,
+                temperature=0.3
+            )
+            raw = response.choices[0].message.content.strip()
+            return clean_answer(raw)
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str or "rate" in error_str.lower():
+                if attempt < 2:
+                    time.sleep(60)
+                    continue
+            return f"<strong>Answer ({marks} marks):</strong><br>Error generating answer"
+
+    return f"<strong>Answer ({marks} marks):</strong><br>Could not generate answer"
+
+def generate_all_answers(questions, notes_text):
+    all_answers = []
+    for i, question in enumerate(questions):
+        print(f"Generating Q{i+1}/{len(questions)}")
+        answer = generate_one_answer(question, notes_text)
+        all_answers.append(answer)
+    return all_answers
+
+def generate_pdf(questions, answers, output_path, subject_name):
+    doc = SimpleDocTemplate(output_path, pagesize=A4)
+    styles = getSampleStyleSheet()
+    story = []
+
+    safe_subject = re.sub(r'[<>&"\']', '', subject_name)
+    story.append(Paragraph(f"{safe_subject} - Answers", styles['Title']))
+    story.append(Spacer(1, 20))
+
+    for i, (question, answer) in enumerate(zip(questions, answers)):
+        marks = question['marks'] if question['marks'] > 0 else 10
+        q_text = f"Q{i+1} ({marks} marks): {question['text']}"
+        q_text = re.sub(r'[<>&]', '', q_text)
+
+        try:
+            story.append(Paragraph(q_text, styles['Heading3']))
+        except:
+            story.append(Paragraph(f"Q{i+1} ({marks} marks)", styles['Heading3']))
+
+        story.append(Spacer(1, 6))
+        clean = re.sub(r'<.*?>', '', answer)
+        story.append(Paragraph(clean, styles['Normal']))
+        story.append(Spacer(1, 20))
+
+    doc.build(story)
 
 @app.route("/")
 def home():
@@ -40,16 +306,16 @@ def signup():
     if request.method == "POST":
         email = request.form["email"]
         password = request.form["password"]
-        db = get_db()
-        cursor = db.cursor()
         try:
-            cursor.execute("INSERT INTO users (email, password_hash) VALUES (?, ?)", (email, password))
-            db.commit()
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO users (email, password_hash) VALUES (%s, %s)", (email, password))
+            conn.commit()
+            cursor.close()
+            conn.close()
             return redirect("/login")
         except:
             return "Email already exists. <a href='/signup'>Try again</a>"
-        finally:
-            db.close()
     return render_template("signup.html")
 
 @app.route("/login", methods=["GET", "POST"])
@@ -57,14 +323,18 @@ def login():
     if request.method == "POST":
         email = request.form["email"]
         password = request.form["password"]
-        db = get_db()
-        cursor = db.cursor()
-        cursor.execute("SELECT id FROM users WHERE email=? AND password_hash=?", (email, password))
-        user = cursor.fetchone()
-        db.close()
-        if user:
-            session["user_id"] = user[0]
-            return redirect("/dashboard")
+        try:
+            conn = get_db()
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+            cursor.execute("SELECT id FROM users WHERE email=%s AND password_hash=%s", (email, password))
+            user = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            if user:
+                session["user_id"] = user['id']
+                return redirect("/dashboard")
+        except:
+            pass
         return "Invalid credentials. <a href='/login'>Try again</a>"
     return render_template("login.html")
 
@@ -77,12 +347,16 @@ def logout():
 def dashboard():
     if "user_id" not in session:
         return redirect("/login")
-    db = get_db()
-    cursor = db.cursor()
-    cursor.execute("SELECT id, name FROM subjects WHERE user_id=?", (session["user_id"],))
-    subjects = cursor.fetchall()
-    db.close()
-    return render_template("dashboard.html", subjects=subjects)
+    try:
+        conn = get_db()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cursor.execute("SELECT id, name FROM subjects WHERE user_id=%s", (session["user_id"],))
+        subjects = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return render_template("dashboard.html", subjects=subjects)
+    except:
+        return "Error loading dashboard"
 
 @app.route("/add_subject", methods=["GET", "POST"])
 def add_subject():
@@ -90,80 +364,117 @@ def add_subject():
         return redirect("/login")
     if request.method == "POST":
         name = request.form["name"]
-        db = get_db()
-        cursor = db.cursor()
-        cursor.execute("INSERT INTO subjects (user_id, name) VALUES (?, ?)", (session["user_id"], name))
-        db.commit()
-        db.close()
-        return redirect("/dashboard")
+        try:
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO subjects (user_id, name) VALUES (%s, %s)", (session["user_id"], name))
+            conn.commit()
+            cursor.close()
+            conn.close()
+            return redirect("/dashboard")
+        except:
+            return "Error creating subject"
     return render_template("add_subject.html")
 
 @app.route("/subject/<int:subject_id>")
 def subject_detail(subject_id):
     if "user_id" not in session:
         return redirect("/login")
-    db = get_db()
-    cursor = db.cursor()
-    cursor.execute("SELECT id, name FROM subjects WHERE id=? AND user_id=?", (subject_id, session["user_id"]))
-    subject = cursor.fetchone()
-    cursor.execute("SELECT q.question_text, q.marks, a.answer_text FROM questions q LEFT JOIN answers a ON q.id = a.question_id WHERE q.subject_id=?", (subject_id,))
-    qa_pairs = cursor.fetchall()
-    db.close()
-    return render_template("subject.html", subject=subject, qa_pairs=qa_pairs) if subject else "Not found"
+    try:
+        conn = get_db()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cursor.execute("SELECT id, name FROM subjects WHERE id=%s AND user_id=%s", (subject_id, session["user_id"]))
+        subject = cursor.fetchone()
+        cursor.execute("SELECT q.question_text, q.marks, a.answer_text FROM questions q LEFT JOIN answers a ON q.id = a.question_id WHERE q.subject_id=%s", (subject_id,))
+        qa_pairs = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return render_template("subject.html", subject=subject, qa_pairs=qa_pairs) if subject else "Not found"
+    except:
+        return "Error loading subject"
 
 @app.route("/upload/<int:subject_id>", methods=["GET", "POST"])
 def upload(subject_id):
     if "user_id" not in session:
         return redirect("/login")
-    
+
     if request.method == "POST":
         try:
-            db = get_db()
-            cursor = db.cursor()
-            
-            # Add sample questions
-            sample_questions = [
-                {"text": "Explain the concept of normalization in DBMS", "marks": 10},
-                {"text": "What is a transaction and its properties?", "marks": 10},
-                {"text": "Define indexing and its types", "marks": 5},
-            ]
-            
-            cursor.execute("DELETE FROM answers WHERE question_id IN (SELECT id FROM questions WHERE subject_id=?)", (subject_id,))
-            cursor.execute("DELETE FROM questions WHERE subject_id=?", (subject_id,))
-            db.commit()
-            
-            for q in sample_questions:
-                cursor.execute("INSERT INTO questions (subject_id, question_text, marks) VALUES (?, ?, ?)", (subject_id, q["text"], q["marks"]))
+            qbank_files = request.files.getlist("qbank")
+            notes_files = request.files.getlist("notes")
+
+            upload_folder = f"uploads/{subject_id}"
+            os.makedirs(upload_folder, exist_ok=True)
+
+            qbank_paths = []
+            for i, f in enumerate(qbank_files):
+                if f and f.filename:
+                    path = os.path.join(upload_folder, f"qbank_{i}.docx")
+                    f.save(path)
+                    qbank_paths.append(path)
+
+            notes_paths = []
+            for i, f in enumerate(notes_files):
+                if f and f.filename:
+                    path = os.path.join(upload_folder, f"notes_{i}.pdf")
+                    f.save(path)
+                    notes_paths.append(path)
+
+            questions = parse_questions(qbank_paths)
+            notes_text = parse_notes(notes_paths)
+
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM answers WHERE question_id IN (SELECT id FROM questions WHERE subject_id=%s)", (subject_id,))
+            cursor.execute("DELETE FROM questions WHERE subject_id=%s", (subject_id,))
+            cursor.execute("DELETE FROM note_chunks WHERE subject_id=%s", (subject_id,))
+            conn.commit()
+
+            answers = generate_all_answers(questions, notes_text)
+
+            for question, answer in zip(questions, answers):
+                cursor.execute("INSERT INTO questions (subject_id, question_text, marks) VALUES (%s, %s, %s)", (subject_id, question["text"], question["marks"]))
                 question_id = cursor.lastrowid
-                answer = generate_sample_answer(q)
-                cursor.execute("INSERT INTO answers (question_id, answer_text, word_count) VALUES (?, ?, ?)", (question_id, answer, len(answer.split())))
-            
-            db.commit()
-            db.close()
-            
+                cursor.execute("INSERT INTO answers (question_id, answer_text, word_count) VALUES (%s, %s, %s)", (question_id, answer, len(answer.split())))
+
+            conn.commit()
+            cursor.close()
+            conn.close()
+
             return redirect(f"/subject/{subject_id}")
         except Exception as e:
+            print(f"Upload error: {e}")
             return f"Error: {str(e)}"
-    
+
     return render_template("upload.html", subject_id=subject_id)
 
 @app.route("/download/<int:subject_id>")
 def download(subject_id):
     if "user_id" not in session:
         return redirect("/login")
-    
-    db = get_db()
-    cursor = db.cursor()
-    cursor.execute("SELECT q.question_text, q.marks, a.answer_text FROM questions q LEFT JOIN answers a ON q.id = a.question_id WHERE q.subject_id=?", (subject_id,))
-    rows = cursor.fetchall()
-    cursor.execute("SELECT name FROM subjects WHERE id=?", (subject_id,))
-    subject = cursor.fetchone()
-    db.close()
-    
-    if not rows:
-        return "No answers to download"
-    
-    return "PDF download feature coming soon"
+
+    try:
+        conn = get_db()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cursor.execute("SELECT q.question_text, q.marks, a.answer_text FROM questions q LEFT JOIN answers a ON q.id = a.question_id WHERE q.subject_id=%s", (subject_id,))
+        rows = cursor.fetchall()
+        cursor.execute("SELECT name FROM subjects WHERE id=%s", (subject_id,))
+        subject = cursor.fetchone()
+        cursor.close()
+        conn.close()
+
+        questions = [{"text": r[0], "marks": r[1]} for r in rows]
+        answers = [r[2] or "" for r in rows]
+
+        output_folder = f"outputs/{subject_id}"
+        os.makedirs(output_folder, exist_ok=True)
+        output_path = os.path.join(output_folder, "answers.pdf")
+
+        generate_pdf(questions, answers, output_path, subject[0])
+
+        return send_file(output_path, as_attachment=True, download_name=f"{subject[0]}_answers.pdf")
+    except Exception as e:
+        return f"Error: {str(e)}"
 
 if __name__ == "__main__":
     app.run(debug=True)
